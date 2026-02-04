@@ -1,5 +1,12 @@
 # codexs-via-leantime
-Status: **unfinished**. a bunch of codex agents jump into docker containers with their own git credentials then do tasks from leantime
+Status: **UNFINISHED — WIP WIP WIP**
+
+⚠️⚠️⚠️ WIP / NOT READY ⚠️⚠️⚠️
+- This repo is in-flight; expect breakage and missing pieces.
+- Do not trust configs, tokens, or flows for production use.
+- Stories/agents/docs will change; treat as an experiment.
+
+A bunch of codex agents jump into docker containers with their own git credentials then do tasks from leantime
 
 ## Quick start: spin up local agents
 
