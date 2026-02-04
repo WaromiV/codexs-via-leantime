@@ -15,6 +15,7 @@ AGENT_ID = os.getenv("AGENT_ID", "0")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8000"))
 WORKSPACE = Path(os.getenv("WORKSPACE_DIR", "/workspace")).resolve()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
+DEFAULT_MODEL = os.getenv("OPENCODE_MODEL", "openai/gpt-5.1-codex-max")
 
 
 class WebRequest(BaseModel):
@@ -49,6 +50,7 @@ class OpencodeRun(BaseModel):
     format: str = "json"
     attach: Optional[str] = None
     timeout: float = 300.0
+    session: Optional[str] = None
 
 
 app = FastAPI(title="Code Agent", version="1.0.0")
@@ -182,19 +184,26 @@ async def opencode_run(payload: OpencodeRun) -> Dict[str, object]:
     cmd = ["opencode", "run", payload.prompt]
     if payload.agent:
         cmd.extend(["--agent", payload.agent])
-    if payload.model:
-        cmd.extend(["--model", payload.model])
+    model = payload.model or DEFAULT_MODEL
+    if model:
+        cmd.extend(["--model", model])
     if payload.attach:
         cmd.extend(["--attach", payload.attach])
-    # Always try to continue prior context; fall back to fresh run on missing session.
-    cmd_with_continue = cmd + ["--continue", "--format", payload.format or "json"]
-    result = run_subprocess(cmd_with_continue, None, payload.timeout)
-    if result.get("return_code") not in (None, 0) and "Session not found" in (
-        result.get("stdout") or ""
-    ):
-        cmd_fresh = cmd + ["--format", payload.format or "json"]
-        result = run_subprocess(cmd_fresh, None, payload.timeout)
-    return result
+
+    # If a session is provided, pass it (ensuring the required "ses" prefix). Otherwise
+    # let opencode generate a fresh session per call to avoid ENOENT lookups.
+    if payload.session:
+        session = (
+            payload.session
+            if payload.session.startswith("ses")
+            else f"ses_{payload.session}"
+        )
+        cmd.extend(["--session", session])
+
+    cmd.extend(["--format", payload.format or "json"])
+
+    # Do not force --continue; rely on new sessions by default.
+    return run_subprocess(cmd, None, payload.timeout)
 
 
 async def main() -> None:

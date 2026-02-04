@@ -40,7 +40,7 @@ def run_cmd(cmd: List[str], env: Dict[str, str] | None = None) -> None:
 
 
 def random_password(length: int = 16) -> str:
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_"
+    alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
@@ -72,7 +72,16 @@ def start_container(
     leantime_token: str | None,
     gitea_username: str | None = None,
     gitea_password: str | None = None,
+    gitea_repo_secret: str | None = None,
     gitea_repo: str | None = None,
+    leantime_username: str | None = None,
+    leantime_password: str | None = None,
+    leantime_mcp_url: str | None = None,
+    model: str | None = None,
+    config_host: str | None = None,
+    auth_host: str | None = None,
+    openai_token: str | None = None,
+    opencode_config_content: str | None = None,
 ) -> None:
     # Clean up any stale container with the same name.
     subprocess.run(
@@ -104,8 +113,26 @@ def start_container(
         cmd.extend(["-e", f"GITEA_USERNAME={gitea_username}"])
     if gitea_password:
         cmd.extend(["-e", f"GITEA_PASSWORD={gitea_password}"])
+    if gitea_repo_secret:
+        cmd.extend(["-e", f"GITEA_REPO_SECRET={gitea_repo_secret}"])
     if gitea_repo:
         cmd.extend(["-e", f"GITEA_REPO={gitea_repo}"])
+    if leantime_username:
+        cmd.extend(["-e", f"LEANTIME_USERNAME={leantime_username}"])
+    if leantime_password:
+        cmd.extend(["-e", f"LEANTIME_PASSWORD={leantime_password}"])
+    if leantime_mcp_url:
+        cmd.extend(["-e", f"LEANTIME_MCP_URL={leantime_mcp_url}"])
+    if model:
+        cmd.extend(["-e", f"OPENCODE_MODEL={model}"])
+    if config_host:
+        cmd.extend(["-v", f"{config_host}:/root/.config/opencode"])
+    if auth_host:
+        cmd.extend(["-v", f"{auth_host}:/root/.local/share/opencode"])
+    if openai_token:
+        cmd.extend(["-e", f"OPENAI_API_KEY={openai_token}"])
+    if opencode_config_content:
+        cmd.extend(["-e", f"OPENCODE_CONFIG_CONTENT={opencode_config_content}"])
 
     cmd.append(image)
     run_cmd(cmd)
@@ -147,6 +174,27 @@ async def wait_for_health(port: int, retries: int = 40, delay: float = 0.5) -> N
     raise RuntimeError(f"Agent on port {port} did not become healthy")
 
 
+def format_repo_with_auth(repo_url: str, username: str, password: str) -> str:
+    parsed = urllib.parse.urlparse(repo_url)
+    netloc = parsed.netloc
+    auth_netloc = f"{username}:{password}@{netloc}"
+    return parsed._replace(netloc=auth_netloc).geturl()
+
+
+def init_repo(container: str, repo_url: str, username: str, secret: str) -> None:
+    auth_url = format_repo_with_auth(repo_url, username, secret)
+    cmds = [
+        f"rm -rf /workspace && git clone {auth_url} /workspace",
+        f"git -C /workspace config user.name {username}",
+        f"git -C /workspace config user.email {username}@example.com",
+        f"git -C /workspace remote set-url origin {auth_url}",
+        "git config --global credential.helper store",
+        f"printf '%s\\n' '{auth_url}' > /root/.git-credentials",
+    ]
+    for cmd in cmds:
+        run_cmd(["docker", "exec", container, "sh", "-c", cmd])
+
+
 async def send_instruction(port: int, prompt: str) -> Dict[str, object]:
     url = f"http://localhost:{port}/opencode_run"
     try:
@@ -161,28 +209,18 @@ async def orchestrate(args: argparse.Namespace) -> None:
     dockerfile = Path("docker/agent/Dockerfile").resolve()
     context = dockerfile.parent
     config_host = Path(args.config_host).expanduser().resolve()
+    auth_host = Path(args.auth_host).expanduser().resolve()
 
-    def create_gitea_token(username: str) -> str:
-        if not args.gitea_admin_token:
-            return ""
-        token_name = f"agent-auto-{username}-{int(time.time())}"
-        data = urllib.parse.urlencode({"name": token_name}).encode()
-        req = urllib.request.Request(
-            f"{args.gitea_url}/api/v1/users/{username}/tokens",
-            data=data,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Authorization": f"token {args.gitea_admin_token}",
-            },
-            method="POST",
-        )
+    openai_token: str | None = None
+    user_passwords: Dict[str, str] = {}
+    auth_file = auth_host / "auth.json"
+    if auth_file.exists():
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = resp.read().decode(errors="replace")
-                parsed = json.loads(body)
-                return parsed.get("sha1", "")
+            data = json.loads(auth_file.read_text())
+            openai_entry = data.get("openai") or {}
+            openai_token = openai_entry.get("access")
         except Exception:
-            return ""
+            openai_token = None
 
     def ensure_gitea_user(username: str, password: str, email: str) -> None:
         if not args.gitea_admin_token:
@@ -213,32 +251,126 @@ async def orchestrate(args: argparse.Namespace) -> None:
         except Exception:
             return
 
+    def add_gitea_collaborator(username: str) -> None:
+        if not args.gitea_admin_token:
+            return
+        parsed = urllib.parse.urlparse(args.gitea_repo)
+        path = parsed.path.lstrip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        if "/" not in path:
+            return
+        owner, repo = path.split("/", 1)
+        url = f"{args.gitea_url}/api/v1/repos/{owner}/{repo}/collaborators/{username}?permission=write"
+        req = urllib.request.Request(
+            url,
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"token {args.gitea_admin_token}",
+            },
+            method="PUT",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except Exception:
+            return
+
+    def create_leantime_user(
+        email: str, password: str, firstname: str, lastname: str
+    ) -> None:
+        if not args.leantime_mcp_url:
+            return
+        payload = {
+            "name": "leantime_create_user",
+            "args": {
+                "email": email,
+                "password": password,
+                "firstname": firstname,
+                "lastname": lastname,
+                "role": "20",
+            },
+        }
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            args.leantime_mcp_url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except Exception:
+            return
+
     if not args.no_build:
         build_image(args.image, dockerfile, context, config_host)
 
-    agents: List[Tuple[str, int, str, str, str, str]] = []
+    agents: List[Tuple[str, int, str, str, str, str, str, str]] = []
 
     for idx in range(args.count):
         port = args.start_port + idx
         name = f"agent-{port}"
         print(f"Starting {name} on port {port}...")
+        ts_suffix = int(time.time())
         username = (
-            f"{args.gitea_user_prefix}{idx + 1}" if args.gitea_user_prefix else ""
+            f"{args.gitea_user_prefix}{idx + 1}-{ts_suffix}"
+            if args.gitea_user_prefix
+            else f"agent-{idx + 1}-{ts_suffix}"
         )
         password = random_password()
         email = f"{username or 'agent'}{int(time.time())}@example.com"
         ensure_gitea_user(username, password, email)
-        token = create_gitea_token(username) if username else ""
+        user_passwords[username] = password
+        token = ""
+        lt_password = random_password()
+        lt_email = f"{username or 'agent'}{int(time.time())}@lt.local"
+        create_leantime_user(lt_email, lt_password, "Agent", username or "Agent")
+        add_gitea_collaborator(username)
+
+        gitea_headers = {}
+        leantime_headers = (
+            {"Authorization": f"Bearer {args.leantime_token}"}
+            if args.leantime_token
+            else {}
+        )
+        mcp_config = {
+            "$schema": "https://opencode.ai/config.json",
+            "mcp": {
+                "gitea_mcp": {
+                    "type": "remote",
+                    "url": args.gitea_mcp_url,
+                    "enabled": True,
+                    "headers": gitea_headers,
+                },
+                "leantime_mcp": {
+                    "type": "remote",
+                    "url": args.leantime_mcp_url,
+                    "enabled": True,
+                    "headers": leantime_headers,
+                },
+            },
+        }
+        config_content = json.dumps(mcp_config)
         start_container(
             name,
             args.image,
             port,
             idx,
-            token or args.gitea_token,
+            args.gitea_token,
             args.leantime_token,
             gitea_username=username,
             gitea_password=password,
+            gitea_repo_secret=password,
             gitea_repo=args.gitea_repo,
+            leantime_username=lt_email,
+            leantime_password=lt_password,
+            leantime_mcp_url=args.leantime_mcp_url,
+            model=args.model,
+            config_host=str(config_host),
+            auth_host=str(auth_host),
+            openai_token=openai_token,
+            opencode_config_content=config_content,
         )
         agents.append(
             (
@@ -246,22 +378,53 @@ async def orchestrate(args: argparse.Namespace) -> None:
                 port,
                 username,
                 password,
-                token or args.gitea_token,
                 args.gitea_repo,
+                lt_email,
+                lt_password,
+                password,
             )
         )
 
     print("Waiting for agents to become healthy...")
-    await asyncio.gather(*(wait_for_health(port) for _, port, _, _, _, _ in agents))
+    await asyncio.gather(
+        *(wait_for_health(port) for _, port, _, _, _, _, _, _ in agents)
+    )
+
+    print("Initializing repositories inside agents...")
+    for name, _, username, _, repo, _, _, repo_secret in agents:
+        if username and repo:
+            init_repo(name, repo, username, repo_secret)
 
     print("Sending instruction to agents...")
     results = []
-    for _, port, username, password, token, repo in agents:
-        cred_note = (
-            f"\nCredentials for you: username={username}, password={password}, token={token}. "
-            f"Repo={repo}."
-        )
-        payload_prompt = args.prompt + cred_note
+    total_agents = len(agents)
+    rules_path = Path("AGENT_RULE.md")
+    rules_text = ""
+    if rules_path.exists():
+        try:
+            rules_text = rules_path.read_text().strip()
+        except Exception:
+            rules_text = ""
+
+    for idx, (_, port, username, password, _, _, _, repo_secret) in enumerate(
+        agents, start=1
+    ):
+        pr_note = (
+            "\nAfter pushing, if gh is unavailable, create a PR via Gitea API: "
+            "curl -u {user}:{pwd} -H 'Content-Type: application/json' "
+            '-d \'{{"title":"<title>","head":"<branch>","base":"main","body":"<body>"}}\' '
+            "{gitea}/api/v1/repos/wa/agentic_playground/pulls"
+        ).format(user=username, pwd=repo_secret, gitea=args.gitea_url)
+        rules_path = Path("AGENT_RULE.md")
+        rules_text = ""
+        if rules_path.exists():
+            try:
+                rules_text = rules_path.read_text().strip()
+            except Exception:
+                rules_text = ""
+        guide_note = "\nRULES (one-time):\n" + rules_text if rules_text else ""
+        ident_note = f"\nYou are agent {idx} of {total_agents}."
+        payload_prompt = args.prompt + ident_note + guide_note + pr_note
         results.append(await send_instruction(port, payload_prompt))
 
     print("\nResponses:")
@@ -313,6 +476,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="Leantime MCP token to pass to agents",
     )
     parser.add_argument(
+        "--leantime-mcp-url",
+        default=os.environ.get("LEANTIME_MCP_URL", "http://172.17.0.1:3101/mcp/call"),
+        help="Leantime MCP server endpoint for provisioning",
+    )
+    parser.add_argument(
         "--gitea-admin-token",
         default=os.environ.get("GITEA_ADMIN_TOKEN", ""),
         help="Admin token used to mint per-user PATs",
@@ -338,6 +506,21 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
             "GITEA_REPO", "http://172.17.0.1:3000/wa/agentic_playground.git"
         ),
         help="Repo URL for agents",
+    )
+    parser.add_argument(
+        "--gitea-mcp-url",
+        default=os.environ.get("GITEA_MCP_URL", "http://172.17.0.1:8082"),
+        help="Gitea MCP URL",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("OPENCODE_MODEL", "openai/gpt-5.1-codex-mini"),
+        help="Model to pass to agents (provider/model)",
+    )
+    parser.add_argument(
+        "--auth-host",
+        default=str(Path.home() / ".local/share/opencode"),
+        help="Host opencode auth dir to mount into agents",
     )
     return parser.parse_args(argv)
 

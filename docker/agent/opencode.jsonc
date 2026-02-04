@@ -11,7 +11,7 @@
     },
     "leantime_mcp": {
       "type": "remote",
-      "url": "http://172.17.0.1:3001/mcp",
+      "url": "http://172.17.0.1:3101/mcp",
       "enabled": true,
       "headers": {
         "Authorization": "Bearer {env:LEANTIME_MCP_TOKEN}"
