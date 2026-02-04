@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "gitea_mcp": {
+      "type": "remote",
+      "url": "http://172.17.0.1:8082",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer {env:GITEA_MCP_TOKEN}"
+      }
+    },
+    "leantime_mcp": {
+      "type": "remote",
+      "url": "http://172.17.0.1:3001/mcp",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer {env:LEANTIME_MCP_TOKEN}"
+      }
+    }
+  }
+}
